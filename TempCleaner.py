@@ -2,176 +2,233 @@
 # -*- coding: utf-8 -*-
 
 """
-Limpeza de Arquivos Temporários no Windows
+temp_cleaner.py - Limpeza segura de arquivos temporários no Windows
 
 Remove arquivos e pastas de locais comuns de temporários:
-    - Pasta TEMP do usuário (%TEMP%)
+    - %TEMP% do usuário
     - C:\Windows\Temp
-    - C:\Windows\Prefetch
+    - C:\Windows\Prefetch (com confirmação)
 
-Arquivos em uso ou sem permissão são ignorados e contabilizados como erros.
-Exibe estatísticas de remoção, erros e espaço liberado.
+Recursos adicionais:
+    - Verificação de privilégios de administrador
+    - Modo dry-run (apenas lista o que seria removido)
+    - Suporte a pastas extras via linha de comando
+    - Logging opcional
+    - Tratamento refinado de erros (PermissionError vs FileNotFoundError)
 
 Uso:
-    Execute como administrador para melhores resultados.
-    python temp_cleaner.py
+    python temp_cleaner.py [--dry-run] [--folders PASTA1 PASTA2] [--log ARQUIVO.log] [--yes]
 
 Autor: [Seu Nome]
-Licença: MIT (ou outra de sua escolha)
+Licença: MIT
 """
 
 import os
 import shutil
 import platform
+import argparse
+import logging
+import ctypes
 from pathlib import Path
-from typing import Tuple
+from typing import List, Tuple, Optional
 
 
-def validar_windows() -> None:
+# ============================================================================
+# CONFIGURAÇÕES E FUNÇÕES AUXILIARES
+# ============================================================================
+
+def is_admin() -> bool:
+    """Retorna True se o processo tem privilégios de administrador no Windows."""
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin()
+    except AttributeError:
+        return False  # Não Windows ou falha ao acessar
+
+
+def formatar_mb(valor: int) -> str:
+    """Converte bytes para megabytes (duas casas decimais)."""
+    return f"{valor / (1024 * 1024):.2f} MB"
+
+
+def configurar_logging(log_file: Optional[str] = None) -> None:
+    """Configura o logging para console e opcionalmente para arquivo."""
+    handlers = [logging.StreamHandler()]
+    if log_file:
+        handlers.append(logging.FileHandler(log_file, encoding='utf-8'))
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=handlers
+    )
+
+
+# ============================================================================
+# FUNÇÕES DE LIMPEZA
+# ============================================================================
+
+def limpar_pasta(pasta: Path, dry_run: bool = False, yes: bool = False) -> Tuple[int, int, int]:
     """
-    Verifica se o sistema operacional é Windows.
-
-    Levanta:
-        RuntimeError: se o sistema não for Windows.
-    """
-    if platform.system() != "Windows":
-        raise RuntimeError("Este script é exclusivo para Windows.")
-
-
-def obter_temp_usuario() -> Path:
-    """
-    Obtém o caminho da pasta TEMP do usuário a partir da variável de ambiente %TEMP%.
-
-    Retorna:
-        Path: caminho da pasta temporária.
-
-    Levanta:
-        RuntimeError: se a variável TEMP não estiver definida.
-    """
-    temp = os.getenv("TEMP")
-    if not temp:
-        raise RuntimeError("Variável de ambiente TEMP não encontrada.")
-    return Path(temp)
-
-
-def calcular_tamanho(pasta: Path) -> int:
-    """
-    Calcula o tamanho total de uma pasta (soma de todos os arquivos) em bytes.
+    Remove arquivos e subpastas de uma pasta.
 
     Args:
-        pasta (Path): diretório a ser calculado.
+        pasta: Caminho da pasta a ser limpa.
+        dry_run: Se True, apenas lista os itens que seriam removidos.
+        yes: Se True, não pede confirmação para pastas sensíveis (Prefetch).
 
     Returns:
-        int: tamanho total em bytes. Arquivos sem permissão são ignorados.
+        (itens_removidos, erros, bytes_liberados)
     """
-    total = 0
-    for item in pasta.rglob("*"):
-        try:
-            if item.is_file():
-                total += item.stat().st_size
-        except (PermissionError, OSError):
-            # Ignora arquivos/pastas sem acesso
-            continue
-    return total
+    if not pasta.exists():
+        logging.info(f"Pasta não encontrada: {pasta}")
+        return 0, 0, 0
 
+    # Confirmação especial para Prefetch
+    if pasta.name.lower() == "prefetch" and not yes:
+        resposta = input(f"Limpar {pasta} pode reduzir desempenho inicial. Continuar? (s/N): ")
+        if resposta.lower() != 's':
+            logging.info(f"Limpeza de {pasta} cancelada pelo usuário.")
+            return 0, 0, 0
 
-def limpar_pasta(pasta: Path) -> Tuple[int, int, int]:
-    """
-    Remove todos os itens (arquivos, links simbólicos e subpastas) de uma pasta.
-
-    Args:
-        pasta (Path): diretório a ser limpo.
-
-    Returns:
-        Tuple[int, int, int]: (itens removidos, erros, bytes liberados)
-
-    Observações:
-        - Se a pasta não existir, retorna (0, 0, 0).
-        - Itens em uso ou sem permissão são ignorados e contam como erro.
-        - Para pastas, usa shutil.rmtree (remove recursivamente).
-    """
     removidos = 0
     erros = 0
     bytes_liberados = 0
 
-    if not pasta.exists():
-        return 0, 0, 0
+    logging.info(f"Processando: {pasta} (dry-run={dry_run})")
 
     for item in pasta.iterdir():
         try:
-            if item.is_file() or item.is_symlink():
+            if item.is_symlink() or item.is_file():
                 # Arquivo ou link simbólico
                 tamanho = item.stat().st_size
-                item.unlink()  # remove
+                if not dry_run:
+                    item.unlink()
                 removidos += 1
                 bytes_liberados += tamanho
+                logging.debug(f"Removeria: {item} ({formatar_mb(tamanho)})" if dry_run
+                              else f"Removido: {item} ({formatar_mb(tamanho)})")
 
             elif item.is_dir():
-                # Pasta: calcula tamanho antes de remover
-                tamanho = calcular_tamanho(item)
-                shutil.rmtree(item)
+                # Pasta: precisa calcular tamanho antes de remover (não podemos remover
+                # e depois somar). Mesmo em dry-run, percorremos a árvore para contar.
+                tamanho = 0
+                # Contagem recursiva de tamanho (pode ser pesada, mas necessária)
+                for root, dirs, files in os.walk(item):
+                    for f in files:
+                        fp = Path(root) / f
+                        try:
+                            tamanho += fp.stat().st_size
+                        except (PermissionError, OSError):
+                            # Ignora arquivos sem acesso, contagem aproximada
+                            pass
+                if not dry_run:
+                    shutil.rmtree(item, ignore_errors=False)
                 removidos += 1
                 bytes_liberados += tamanho
+                logging.debug(f"Removeria pasta: {item} ({formatar_mb(tamanho)})" if dry_run
+                              else f"Pasta removida: {item} ({formatar_mb(tamanho)})")
 
-        except (PermissionError, OSError):
-            # Arquivo/pasta em uso ou sem permissão
+        except PermissionError:
             erros += 1
-            continue
+            logging.warning(f"Sem permissão para remover: {item}")
+        except FileNotFoundError:
+            # Item já foi removido por outro processo, ignorar
+            logging.debug(f"Item não encontrado (já removido?): {item}")
+        except OSError as e:
+            erros += 1
+            logging.error(f"Erro ao remover {item}: {e}")
 
     return removidos, erros, bytes_liberados
 
 
-def formatar_mb(valor: int) -> str:
-    """
-    Converte bytes para megabytes com duas casas decimais.
+# ============================================================================
+# FUNÇÕES PRINCIPAIS
+# ============================================================================
 
-    Args:
-        valor (int): tamanho em bytes.
-
-    Returns:
-        str: string no formato "X.XX MB"
-    """
-    return f"{valor / (1024 * 1024):.2f} MB"
+def obter_pastas_padrao() -> List[Path]:
+    """Retorna a lista de pastas padrão a serem limpas."""
+    pastas = [Path(os.getenv("TEMP", ""))]
+    if not pastas[0] or not pastas[0].exists():
+        pastas[0] = Path(os.environ.get("TEMP", ""))
+    pastas.append(Path(r"C:\Windows\Temp"))
+    pastas.append(Path(r"C:\Windows\Prefetch"))
+    # Remove pastas vazias ou inválidas
+    return [p for p in pastas if p and str(p).strip()]
 
 
 def main() -> None:
-    """
-    Função principal:
-        - Verifica ambiente Windows.
-        - Define as pastas a limpar.
-        - Executa a limpeza e acumula estatísticas.
-        - Exibe relatório final.
-    """
-    validar_windows()
+    """Função principal com parsing de argumentos e execução."""
+    # Argumentos de linha de comando
+    parser = argparse.ArgumentParser(
+        description="Limpeza de arquivos temporários no Windows."
+    )
+    parser.add_argument(
+        '--dry-run', action='store_true',
+        help="Apenas lista os arquivos que seriam removidos (não executa remoção)"
+    )
+    parser.add_argument(
+        '--folders', nargs='+', default=[],
+        help="Pastas adicionais a serem limpas (forneça os caminhos)"
+    )
+    parser.add_argument(
+        '--log', type=str, help="Arquivo para salvar log das operações"
+    )
+    parser.add_argument(
+        '--yes', action='store_true',
+        help="Responde 'sim' automaticamente para confirmações (ex.: Prefetch)"
+    )
+    args = parser.parse_args()
 
-    # Lista de pastas temporárias comuns no Windows
-    pastas = [
-        obter_temp_usuario(),
-        Path(r"C:\Windows\Temp"),
-        Path(r"C:\Windows\Prefetch"),
-    ]
+    # Configurar logging
+    configurar_logging(args.log)
 
+    # Verificar sistema operacional
+    if platform.system() != "Windows":
+        logging.error("Este script é exclusivo para Windows.")
+        return
+
+    # Verificar privilégios
+    if not is_admin():
+        logging.warning("Executando sem privilégios de administrador. "
+                        "Pastas do sistema (Windows\\Temp, Prefetch) podem falhar.")
+
+    # Definir pastas a processar
+    pastas = obter_pastas_padrao()
+    if args.folders:
+        for folder in args.folders:
+            pastas.append(Path(folder))
+
+    # Remover duplicatas (preservando ordem)
+    pastas_unicas = []
+    for p in pastas:
+        if p.resolve() not in [x.resolve() for x in pastas_unicas]:
+            pastas_unicas.append(p)
+
+    # Acumuladores
     total_removidos = 0
     total_erros = 0
     total_bytes = 0
 
-    for pasta in pastas:
-        print(f"\nLimpando: {pasta}")
-
-        removidos, erros, bytes_liberados = limpar_pasta(pasta)
+    # Processar cada pasta
+    for pasta in pastas_unicas:
+        print(f"\n--- Limpando: {pasta} ---")
+        removidos, erros, bytes_liberados = limpar_pasta(pasta, args.dry_run, args.yes)
 
         total_removidos += removidos
         total_erros += erros
         total_bytes += bytes_liberados
 
         print(f"Removidos: {removidos}")
-        print(f"Ignorados (em uso/permissão): {erros}")
+        print(f"Ignorados (erros/permissão): {erros}")
         print(f"Espaço liberado: {formatar_mb(bytes_liberados)}")
 
+    # Resumo final
     print("\n===== RESUMO FINAL =====")
-    print(f"Total removido: {total_removidos}")
-    print(f"Total ignorado: {total_erros}")
+    print(f"Total de itens processados: {total_removidos}")
+    print(f"Total de erros: {total_erros}")
     print(f"Total liberado: {formatar_mb(total_bytes)}")
+
+    if args.dry_run:
+        print("\n(Modo dry-run – nenhuma alteração foi realizada.)")
 
 
 if __name__ == "__main__":

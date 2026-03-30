@@ -2,18 +2,22 @@
 # -*- coding: utf-8 -*-
 
 """
-temp_cleaner.py - Utilitário para limpeza de arquivos temporários no Windows.
+Limpeza de Arquivos Temporários no Windows
 
-Remove arquivos e pastas dos seguintes locais:
-    - Pasta TEMP do usuário (obtida da variável de ambiente %TEMP%)
-    - Temp
-    - Prefetch
+Remove arquivos e pastas de locais comuns de temporários:
+    - Pasta TEMP do usuário (%TEMP%)
+    - C:\Windows\Temp
+    - C:\Windows\Prefetch
 
 Arquivos em uso ou sem permissão são ignorados e contabilizados como erros.
 Exibe estatísticas de remoção, erros e espaço liberado.
 
 Uso:
-    Execute o script diretamente (como administrador para melhores resultados).
+    Execute como administrador para melhores resultados.
+    python temp_cleaner.py
+
+Autor: [Seu Nome]
+Licença: MIT (ou outra de sua escolha)
 """
 
 import os
@@ -27,7 +31,7 @@ def validar_windows() -> None:
     """
     Verifica se o sistema operacional é Windows.
 
-    Raises:
+    Levanta:
         RuntimeError: se o sistema não for Windows.
     """
     if platform.system() != "Windows":
@@ -36,12 +40,12 @@ def validar_windows() -> None:
 
 def obter_temp_usuario() -> Path:
     """
-    Obtém o caminho da pasta TEMP do usuário a partir da variável de ambiente.
+    Obtém o caminho da pasta TEMP do usuário a partir da variável de ambiente %TEMP%.
 
-    Returns:
+    Retorna:
         Path: caminho da pasta temporária.
 
-    Raises:
+    Levanta:
         RuntimeError: se a variável TEMP não estiver definida.
     """
     temp = os.getenv("TEMP")
@@ -58,36 +62,33 @@ def calcular_tamanho(pasta: Path) -> int:
         pasta (Path): diretório a ser calculado.
 
     Returns:
-        int: tamanho total em bytes. Ignora arquivos sem permissão ou erros de acesso.
+        int: tamanho total em bytes. Arquivos sem permissão são ignorados.
     """
     total = 0
-    # rglob('*') percorre recursivamente todos os arquivos e subpastas
     for item in pasta.rglob("*"):
         try:
             if item.is_file():
                 total += item.stat().st_size
         except (PermissionError, OSError):
-            # Arquivos sem permissão são ignorados na contagem de tamanho
+            # Ignora arquivos/pastas sem acesso
             continue
     return total
 
 
 def limpar_pasta(pasta: Path) -> Tuple[int, int, int]:
     """
-    Remove todos os itens (arquivos e subpastas) de uma pasta.
+    Remove todos os itens (arquivos, links simbólicos e subpastas) de uma pasta.
 
     Args:
         pasta (Path): diretório a ser limpo.
 
     Returns:
-        Tuple[int, int, int]: (número de itens removidos, número de erros, bytes liberados)
+        Tuple[int, int, int]: (itens removidos, erros, bytes liberados)
 
     Observações:
         - Se a pasta não existir, retorna (0, 0, 0).
-        - Para arquivos em uso ou sem permissão, ocorre erro (PermissionError/OSError)
-          e o item é ignorado, incrementando o contador de erros.
-        - Para pastas, utiliza shutil.rmtree, que pode falhar se houver arquivos em uso
-          ou sem permissão; nesse caso, a exceção é capturada e contada como erro.
+        - Itens em uso ou sem permissão são ignorados e contam como erro.
+        - Para pastas, usa shutil.rmtree (remove recursivamente).
     """
     removidos = 0
     erros = 0
@@ -96,25 +97,24 @@ def limpar_pasta(pasta: Path) -> Tuple[int, int, int]:
     if not pasta.exists():
         return 0, 0, 0
 
-    # Itera sobre os itens imediatos (não recursivo)
     for item in pasta.iterdir():
         try:
             if item.is_file() or item.is_symlink():
-                # Obtém tamanho antes de remover
+                # Arquivo ou link simbólico
                 tamanho = item.stat().st_size
-                item.unlink()  # remove arquivo ou symlink
+                item.unlink()  # remove
                 removidos += 1
                 bytes_liberados += tamanho
 
             elif item.is_dir():
-                # Calcula tamanho total da pasta antes de removê-la
+                # Pasta: calcula tamanho antes de remover
                 tamanho = calcular_tamanho(item)
-                shutil.rmtree(item)  # remove a pasta e todo seu conteúdo
+                shutil.rmtree(item)
                 removidos += 1
                 bytes_liberados += tamanho
 
         except (PermissionError, OSError):
-            # Arquivo/pasta em uso, sem permissão ou outro erro de sistema
+            # Arquivo/pasta em uso ou sem permissão
             erros += 1
             continue
 
@@ -123,13 +123,13 @@ def limpar_pasta(pasta: Path) -> Tuple[int, int, int]:
 
 def formatar_mb(valor: int) -> str:
     """
-    Formata um valor em bytes para megabytes (MB) com duas casas decimais.
+    Converte bytes para megabytes com duas casas decimais.
 
     Args:
         valor (int): tamanho em bytes.
 
     Returns:
-        str: string formatada (ex.: "15.34 MB")
+        str: string no formato "X.XX MB"
     """
     return f"{valor / (1024 * 1024):.2f} MB"
 
@@ -137,9 +137,9 @@ def formatar_mb(valor: int) -> str:
 def main() -> None:
     """
     Função principal:
-        - Valida sistema operacional.
-        - Define lista de pastas a serem limpas.
-        - Para cada pasta, executa a limpeza e acumula estatísticas.
+        - Verifica ambiente Windows.
+        - Define as pastas a limpar.
+        - Executa a limpeza e acumula estatísticas.
         - Exibe relatório final.
     """
     validar_windows()
